@@ -1,0 +1,13 @@
+----------------------------------------------------------------
+Thu Feb 05 16:29:43 ICT 2026:
+Booting Derby version The Apache Software Foundation - Apache Derby - 10.14.2.0 - (1828579): instance a816c00e-019c-2d22-d327-00010898da00 
+on database directory /home/nql/PycharmProjects/HadoopDataPipeline/src/metastore_db with class loader jdk.internal.loader.ClassLoaders$AppClassLoader@42110406 
+Loaded from file:/home/sparkusr/spark-3.5.7/jars/derby-10.14.2.0.jar
+java.vendor=Amazon.com Inc.
+java.runtime.version=11.0.29+7-LTS
+user.dir=/home/nql/PycharmProjects/HadoopDataPipeline/src
+os.name=Linux
+os.arch=amd64
+os.version=6.16.10-200.fc42.x86_64
+derby.system.home=null
+Database Class Loader started - derby.database.classpath=''
