@@ -54,7 +54,7 @@ if __name__ == "__main__":
             .config("spark.jars.packages", "org.postgresql:postgresql:42.7.3") \
             .config("spark.driver.memory", "8g") \
             .config("spark.executor.memory", "4g") \
-            .config("spark.sql.shuffle.partitions", "200") \
+            .config("spark.sql.shuffle.partitions", "5") \
             .config("spark.sql.warehouse.dir", "hdfs://localhost:9000/warehouse") \
             .config("hive.metastore.uris", "thrift://localhost:9083") \
             .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \

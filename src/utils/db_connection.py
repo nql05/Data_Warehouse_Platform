@@ -13,7 +13,7 @@ def get_upstream_table(
     table_name: str,
     spark: SparkSession,
     execution_date: Optional[datetime] = None,
-    incremental_column: str = "created_at"
+    incremental_column: str = "updated_at"
 ):
     """
     Get upstream table with incremental load support.

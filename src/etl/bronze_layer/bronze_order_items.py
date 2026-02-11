@@ -38,12 +38,12 @@ class OrderItemBronzeETL(TableETL):
         table_name = "order_items"
 
         # Pass execution_date for incremental load
-        # This will only fetch records where created_at matches the execution date
+        # This will only fetch records where updated_at matches the execution date
         order_data = get_upstream_table(
             table_name,
             self.spark,
             execution_date=self.execution_date,
-            incremental_column="created_at"  # or "updated_at" depending on your needs
+            incremental_column="updated_at"
         )
 
         # Create ETLDataset instance
