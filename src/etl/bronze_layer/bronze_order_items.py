@@ -1,10 +1,9 @@
-from datetime import datetime
 from typing import Dict, List, Optional, Type
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit
 
-from src.utils.base_table import ETLDataset, TableETL
-from src.utils.db_connection import get_upstream_table
+from utils.base_table import ETLDataset, TableETL
+from utils.db_connection import get_upstream_table
 
 
 class OrderItemBronzeETL(TableETL):
@@ -16,9 +15,10 @@ class OrderItemBronzeETL(TableETL):
                  storage_path: str = "hdfs://localhost:9000/datalake/bronze/order_items",
                  data_format: str = "parquet",
                  database: str = "ecommerce",
-                 partition_keys: List[str] = ["inserted_time"],
+                 partition_keys: List[str] = ["year", "month", "day"],
                  run_upstream: bool = True,
-                 load_data: bool = True
+                 load_data: bool = True,
+                 date_params: Optional[Dict[str, str]] = None
                  ) -> None:
         super().__init__(
             spark,
@@ -30,12 +30,21 @@ class OrderItemBronzeETL(TableETL):
             database,
             partition_keys,
             run_upstream,
-            load_data
+            load_data,
+            date_params
         )
 
     def extract_upstream(self) -> List[ETLDataset]:
         table_name = "order_items"
-        order_data = get_upstream_table(table_name, self.spark)
+
+        # Pass execution_date for incremental load
+        # This will only fetch records where created_at matches the execution date
+        order_data = get_upstream_table(
+            table_name,
+            self.spark,
+            execution_date=self.execution_date,
+            incremental_column="created_at"  # or "updated_at" depending on your needs
+        )
 
         # Create ETLDataset instance
         order_dataset = ETLDataset(
@@ -52,9 +61,9 @@ class OrderItemBronzeETL(TableETL):
 
     def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
         user_data = upstream_datasets[0].curr_data
-        current_timestamp = datetime.now()
 
-        transformed_data = user_data.withColumn("inserted_time", lit(current_timestamp))
+        # Add partition columns (year, month, day) using the base class method
+        transformed_data = self.add_partition_columns(user_data)
 
         etl_dataset = ETLDataset(
             name=self.name,
@@ -68,10 +77,25 @@ class OrderItemBronzeETL(TableETL):
 
         return etl_dataset
 
-    def read(self, partition_values: Optional[Dict[str, str]]) -> ETLDataset:
-        partition_filter = ""
-        data = self.transform_upstream(self.extract_upstream())
+    def read(self, partition_values: Optional[Dict[str, str]] = None) -> ETLDataset:
+        """
+        Read data from HDFS with optional partition filtering.
+
+        Args:
+            partition_values: Dict with partition keys like {"year": "2026", "month": "2", "day": "11"}
+                             If None, will use date_params if available
+        """
+        # If no partition_values provided, use date_params
+        if partition_values is None and self.date_params:
+            partition_values = {
+                "year": str(self.date_params.get("year")),
+                "month": str(self.date_params.get("month")),
+                "day": str(self.date_params.get("day"))
+            }
+
+        # If load_data is False, return transformed data without reading from HDFS
         if not self.load_data:
+            data = self.transform_upstream(self.extract_upstream())
             return ETLDataset(
                 name=self.name,
                 curr_data=data.curr_data,
@@ -81,19 +105,15 @@ class OrderItemBronzeETL(TableETL):
                 database=self.database,
                 partition_keys=self.partition_keys
             )
-        if partition_values:
-            partition_filter = " AND ".join(
-                [f"{k} = '{v}'" for k, v in partition_values.items()]
-            )
-        else:
-            latest_partition = (
-                self.spark.read.format(self.data_format).load(self.storage_path).selectExpr(
-                    "max(inserted_time)").collect()[0][0]
-            )
-            partition_filter = f"inserted_time = '{latest_partition}'"
 
         # Read the user data from the HDFS
-        user_data = self.spark.read.format(self.data_format).load(self.storage_path).filter(partition_filter)
+        user_data = self.spark.read.format(self.data_format).load(self.storage_path)
+
+        # Apply partition filter if provided
+        if partition_values:
+            for key, value in partition_values.items():
+                if value is not None:
+                    user_data = user_data.filter(col(key) == value)
 
         user_data = user_data.select(
             col("order_id"),
@@ -103,7 +123,9 @@ class OrderItemBronzeETL(TableETL):
             col("shipping_limit_date"),
             col("price"),
             col("freight_value"),
-            col("inserted_time")
+            col("year"),
+            col("month"),
+            col("day")
         )
 
         etl_dataset = ETLDataset(

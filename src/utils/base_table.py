@@ -1,8 +1,11 @@
 from __future__ import annotations
+
+import os.path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Type
 from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 class InValidDataException(Exception):
     pass
@@ -29,21 +32,10 @@ class TableETL(ABC):
                  database: str,
                  partition_keys: List[str],
                  run_upstream: bool = True,
-                 load_data: bool = True
+                 load_data: bool = True,
+                 date_params: Optional[Dict[str, str]] = None
                  ) -> None:
-        """
 
-        :param spark:
-        :param upstream_table_names:
-        :param name:
-        :param primary_keys:
-        :param storage_path:
-        :param data_format:
-        :param database:
-        :param partition_keys:
-        :param run_upstream: Controls the ETL dependency chain execution. True -> run all upstream ETL tables first, False -> Skips upstream execution and assumes data is already available
-        :param load_data: Controls whether to persist data to storage. True -> writes transformed data to HDFS and register in Hive, False -> Keeps data in memory only (DataFrame), doesn't save to storage
-        """
         self.spark = spark
         self.upstream_table_names = upstream_table_names
         self.name = name
@@ -54,6 +46,32 @@ class TableETL(ABC):
         self.partition_keys = partition_keys
         self.run_upstream = run_upstream
         self.load_data = load_data
+        self.date_params = date_params or {}
+
+    @property
+    def year(self):
+        return self.date_params.get("year", "")
+
+    @property
+    def month(self):
+        return self.date_params.get("month", "")
+
+    @property
+    def day(self):
+        return self.date_params.get("day", "")
+
+    @property
+    def execution_date(self):
+        return self.date_params.get("execution_date")
+
+    def add_partition_columns(self, df: DataFrame) -> DataFrame:
+        """Add year, month, day partition columns"""
+        return (df
+                .withColumn("year", F.lit(self.year))
+                .withColumn("month", F.lit(self.month))
+                .withColumn("day", F.lit(self.day))
+                .withColumn("inserted_time", F.lit(self.execution_date))
+                )
 
     @abstractmethod
     def extract_upstream(self) -> List[ETLDataset]:
@@ -67,7 +85,7 @@ class TableETL(ABC):
         return True
 
     def load(self, data: ETLDataset):
-        data.curr_data.write.format(data.data_format).mode("overwrite").partitionBy(data.partition_keys).save(data.storage_path)
+        data.curr_data.write.format(data.data_format).mode("overwrite").partitionBy("year", "month", "day").save(data.storage_path)
 
     def run(self):
         transformed_data = self.transform_upstream(self.extract_upstream())

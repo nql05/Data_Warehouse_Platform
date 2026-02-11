@@ -22,7 +22,8 @@ class CustomerReportGoldETL(TableETL):
                  database: str = "ecommerce",
                  partition_keys: List[str] = ["order_inserted_time"],
                  run_upstream: bool = True,
-                 load_data: bool = True
+                 load_data: bool = True,
+                 date_params: dict
                  ):
         super().__init__(
             spark,
@@ -35,6 +36,7 @@ class CustomerReportGoldETL(TableETL):
             partition_keys,
             run_upstream,
             load_data,
+            date_params
         )
 
     def load(self, data: ETLDataset):
