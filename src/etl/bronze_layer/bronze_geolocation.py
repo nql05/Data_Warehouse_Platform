@@ -1,24 +1,25 @@
 from datetime import datetime
 from typing import Dict, List, Optional, Type
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
+from pyspark.sql import functions as F
 
-from src.utils.base_table import ETLDataset, TableETL
-from src.utils.db_connection import get_upstream_table
+from utils.base_table import ETLDataset, TableETL, DataQualityException
+from utils.db_connection import JDBCConnection
+from utils.metadata_connection import MetadataConnection
 
 
 class GeolocationBronzeETL(TableETL):
     def __init__(self,
                  spark: SparkSession,
+                 jdbc_conn: JDBCConnection,
+                 metadata_jdbc_conn: JDBCConnection,
                  upstream_table_names: Optional[List[Type[TableETL]]] = None,
                  name: str = "geolocation",
                  primary_keys: List[str] = ["geolocation_zip_code_prefix"],
                  storage_path: str = "hdfs://localhost:9000/datalake/bronze/geolocation",
                  data_format: str = "parquet",
                  database: str = "ecommerce",
-                 partition_keys: List[str] = ["inserted_time"],
-                 run_upstream: bool = True,
-                 load_data: bool = True
+                 partition_keys: List[str] = ["updated_date"]
                  ) -> None:
         super().__init__(
             spark,
@@ -28,33 +29,74 @@ class GeolocationBronzeETL(TableETL):
             storage_path,
             data_format,
             database,
-            partition_keys,
-            run_upstream,
-            load_data
+            partition_keys
         )
+        self.jdbc_conn = jdbc_conn
+        self.metadata_jdbc_conn = MetadataConnection(metadata_jdbc_conn)
+
+    @property
+    def metadata_conn(self):
+        return self.metadata_jdbc_conn
 
     def extract_upstream(self) -> List[ETLDataset]:
         table_name = "geolocation"
-        order_data = get_upstream_table(table_name, self.spark)
+
+        # Fetch source metadata to determine pull strategy
+        src_metadata = self.metadata_conn.get_source_metadata(table_name)
+        pull_typ = src_metadata.pull_typ.upper()
+
+        qualified_table = (
+            f"{src_metadata.src_schema_name}.{src_metadata.src_tbname}"
+            if src_metadata.src_schema_name
+            else src_metadata.src_tbname
+        )
+
+        if pull_typ == "FULL":
+            # Qualify with schema name if available
+            geolocation_data = self.jdbc_conn.read_full_table(
+                table_name=qualified_table,
+                partition_column="updated_at",
+                num_partitions=16
+            )
+        elif pull_typ == "INCREMENTAL":
+            last_run = self.metadata_jdbc_conn.get_last_successful_run(self.name)
+            geolocation_data = self.jdbc_conn.read_incremental_table(
+                table_name=qualified_table,
+                last_updated="updated_at",
+                last_run=last_run,
+                partition_column=self.partition_keys[0],
+                num_partitions=16
+            )
+        else:
+            raise ValueError(
+                f"[GeolocationBronzeETL] Unknown pull_type '{pull_typ}' "
+                f"for source table '{table_name}'"
+            )
+
+        records_pulled = geolocation_data.count()
 
         # Create ETLDataset instance
-        order_dataset = ETLDataset(
+        geolocation_dataset = ETLDataset(
             name=self.name,
-            curr_data=order_data,  # DataFrame
+            curr_data=geolocation_data,  # DataFrame
             primary_keys=self.primary_keys,
             storage_path=self.storage_path,
             data_format=self.data_format,
             database=self.database,
-            partition_keys=self.partition_keys
+            partition_keys=self.partition_keys,
+            records_pulled=records_pulled
         )
 
-        return [order_dataset]
+        return [geolocation_dataset]
 
     def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
-        user_data = upstream_datasets[0].curr_data
-        current_timestamp = datetime.now()
+        geolocation_data = upstream_datasets[0].curr_data
+        records_pulled = upstream_datasets[0].records_pulled
 
-        transformed_data = user_data.withColumn("inserted_time", lit(current_timestamp))
+        transformed_data = (
+            geolocation_data
+            .withColumn("updated_date", F.to_date(F.col("updated_at")))
+        )
 
         etl_dataset = ETLDataset(
             name=self.name,
@@ -63,54 +105,54 @@ class GeolocationBronzeETL(TableETL):
             storage_path=self.storage_path,
             data_format=self.data_format,
             database=self.database,
-            partition_keys=self.partition_keys
+            partition_keys=self.partition_keys,
+            records_pulled=records_pulled
         )
-
         return etl_dataset
 
     def read(self, partition_values: Optional[Dict[str, str]]) -> ETLDataset:
-        partition_filter = ""
-        data = self.transform_upstream(self.extract_upstream())
-        if not self.load_data:
-            return ETLDataset(
-                name=self.name,
-                curr_data=data.curr_data,
-                primary_keys=self.primary_keys,
-                storage_path=self.storage_path,
-                data_format=self.data_format,
-                database=self.database,
-                partition_keys=self.partition_keys
-            )
+        # Build partition filter from updated_date
         if partition_values:
+            # e.g. {"updated_date": "2024-01-15"}
             partition_filter = " AND ".join(
-                [f"{k} = '{v}'" for k, v in partition_values.items()]
+                f"{k} = '{v}'" for k, v in partition_values.items()
             )
         else:
+            # Fall back to the latest updated_date partition
             latest_partition = (
-                self.spark.read.format(self.data_format).load(self.storage_path).selectExpr(
-                    "max(inserted_time)").collect()[0][0]
+                self.spark.read.format(self.data_format)
+                .load(self.storage_path)
+                .selectExpr("max(updated_date)")
+                .collect()[0][0]
             )
-            partition_filter = f"inserted_time = '{latest_partition}'"
+            partition_filter = f"updated_date = '{latest_partition}'"
 
-            # Read the user data from the HDFS
-            user_data = self.spark.read.format(self.data_format).load(self.storage_path).filter(partition_filter)
+        # Read from HDFS and apply the partition filter
+        raw_data = (
+            self.spark.read.format(self.data_format)
+                .load(self.storage_path)
+                .filter(partition_filter)
+        )
 
-            user_data = user_data.select(
-                col("geolocation_zip_code_prefix"),
-                col("geolocation_lat"),
-                col("geolocation_lng"),
-                col("geolocation_city"),
-                col("geolocation_state"),
-                col("inserted_time")
-            )
+        user_data = raw_data.select(
+            F.col("geolocation_zip_code_prefix"),
+            F.col("geolocation_lat"),
+            F.col("geolocation_lng"),
+            F.col("geolocation_city"),
+            F.col("geolocation_state"),
+            F.col("updated_date")
+        )
 
-            etl_dataset = ETLDataset(
-                name=self.name,
-                curr_data=user_data,
-                primary_keys=self.primary_keys,
-                storage_path=self.storage_path,
-                data_format=self.data_format,
-                database=self.database,
-                partition_keys=self.partition_keys
-            )
-            return etl_dataset
+        return ETLDataset(
+            name=self.name,
+            curr_data=user_data,
+            primary_keys=self.primary_keys,
+            storage_path=self.storage_path,
+            data_format=self.data_format,
+            database=self.database,
+            partition_keys=self.partition_keys
+        )
+
+
+
+

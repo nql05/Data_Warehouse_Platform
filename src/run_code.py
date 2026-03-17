@@ -1,65 +1,67 @@
 import findspark
 findspark.init("/home/sparkusr/spark-3.5.7")
 from pyspark.sql import SparkSession
-from datetime import datetime, timedelta
-import argparse
-# from etl.gold_layer.customer_report import CustomerReportGoldETL
-# from etl.gold_layer.seller_report import SellerReportGoldETL
-from etl.bronze_layer.bronze_order_items import OrderItemBronzeETL
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Ecommerce Data Warehouse")
-    parser.add_argument("--execution-date", type=str, required=False,
-                        help="Execution date (YYYY-MM-DD)")
-    return parser.parse_args()
+from etl.gold_layer.customer_report import CustomerReportGoldETL
+from etl.gold_layer.seller_report import SellerReportGoldETL
+from utils.db_connection import JDBCConnection, DBConfig
 
 
-def get_execution_date(args):
-    """Parse execution date or default to yesterday."""
-    if args.execution_date:
-        exec_date = datetime.strptime(args.execution_date, "%Y-%m-%d").date()
-    else:
-        exec_date = (datetime.now() - timedelta(days=1)).date()
+def run_code(spark):
+    source_jdbc = JDBCConnection(
+        spark=spark,
+        db_conn=DBConfig(
+            host="localhost",
+            port=5432,
+            db="ecommerce",
+            user="postgres",
+            password="Linh@280405",
+            db_type="postgresql"
+        )
+    )
 
-    # Split into year, month, day
-    return {
-        "execution_date": exec_date,
-        "year": exec_date.year,
-        "month": exec_date.month,
-        "day": exec_date.day
-    }
+    metadata_jdbc = JDBCConnection(
+        spark=spark,
+        db_conn=DBConfig(
+            host="localhost",
+            port=5432,
+            db="metadata",
+            user="postgres",
+            password="Linh@280405",
+            db_type="postgresql"
+        )
+    )
 
-def run_code(spark, date_params):
-    # customer_report_data = CustomerReportGoldETL(spark=spark, date_params=date_params)
-    # customer_report_data.run()
-    #
-    # seller_report_data = SellerReportGoldETL(spark=spark, date_params=date_params)
-    # seller_report_data.run()
-    order_table = OrderItemBronzeETL(spark=spark, date_params=date_params)
-    order_table.run()
-    result = order_table.read()
-    result.curr_data.limit(20).show()
+    # Gold Layer ETL tables (bronze and silver are run automatically upstream)
+    gold_tables = [
+        CustomerReportGoldETL(
+            spark=spark,
+            jdbc_conn=source_jdbc,
+            metadata_jdbc_conn=metadata_jdbc
+        ),
+        SellerReportGoldETL(
+            spark=spark,
+            jdbc_conn=source_jdbc,
+            metadata_jdbc_conn=metadata_jdbc
+        ),
+    ]
+
+    for table in gold_tables:
+        print(f"[INFO] Running Gold ETL for: {table.name}")
+        table.run()
+        print(f"[INFO] Completed Gold ETL for: {table.name}")
+
 
 if __name__ == "__main__":
-    args = parse_args()
-    date_params = get_execution_date(args)
-
-    print(f"Running pipeline for: {date_params['execution_date']} "
-          f"(year={date_params['year']}, month={date_params['month']}, day={date_params['day']})")
 
     # Create a Spark Session
-    spark = (SparkSession.builder. \
-            appName("Ecommerce Data Pipeline") \
-            .master("local[*]") \
-            .config("spark.jars.packages", "org.postgresql:postgresql:42.7.3") \
-            .config("spark.driver.memory", "8g") \
-            .config("spark.executor.memory", "4g") \
-            .config("spark.sql.shuffle.partitions", "5") \
-            .config("spark.sql.warehouse.dir", "hdfs://localhost:9000/warehouse") \
-            .config("hive.metastore.uris", "thrift://localhost:9083") \
-            .config("spark.sql.sources.partitionOverwriteMode", "dynamic") \
-            .enableHiveSupport() \
-            .getOrCreate())
+    spark = (
+        SparkSession.builder
+        .appName("Ecommerce Data Pipeline")
+        .getOrCreate()
+    )
 
     spark.sparkContext.setLogLevel("ERROR")
-    run_code(spark, date_params)
+    run_code(spark)
+
+    input("Press Enter to exit and close Spark UI ...")
+    spark.stop()

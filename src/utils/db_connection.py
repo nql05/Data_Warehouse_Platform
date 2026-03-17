@@ -1,63 +1,167 @@
-import os
-from dotenv import load_dotenv
-from pyspark.sql import SparkSession
-from datetime import datetime, timedelta
-from typing import Optional
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
-# Load environment variables from .env file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.join(current_dir, ".env")
-load_dotenv(env_path)
+# Use a structured logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DataPlatform.Ingestion")
 
-def get_upstream_table(
-    table_name: str,
-    spark: SparkSession,
-    execution_date: Optional[datetime] = None,
-    incremental_column: str = "updated_at"
-):
-    """
-    Get upstream table with incremental load support.
+JDBC_DRIVERS = {
+    "postgresql": ("jdbc:postgresql", "org.postgresql.Driver"),
+    "sqlserver":  ("jdbc:sqlserver",  "com.microsoft.sqlserver.jdbc.SQLServerDriver"),
+    "mysql":      ("jdbc:mysql",      "com.mysql.cj.jdbc.Driver"),
+}
 
-    Args:
-        table_name: Name of the table to read
-        spark: SparkSession
-        execution_date: Date to filter data (reads data created/updated on this date)
-        incremental_column: Column to use for incremental filtering (created_at or updated_at)
+@dataclass(frozen=True)
+class DBConfig:
+    db: str
+    user: str
+    password: str
+    host: str
+    port: str
+    db_type: str
 
-    Returns:
-        DataFrame with filtered data
-    """
-    host = os.getenv("DB_HOST")
-    port = os.getenv("DB_PORT")
-    db = os.getenv("DATABASE")
-    jdbc_url = f"jdbc:postgresql://{host}:{port}/{db}"
-    connection_properties = {
-        "user": os.getenv("DB_USER"),
-        "password": os.getenv("DB_PASSWORD"),
-        "driver": "org.postgresql.Driver"
-    }
+class DBConnection(ABC):
+    @abstractmethod
+    def read_full_table(self, table_name: str):
+        pass
 
-    # If execution_date is provided, do incremental load
-    if execution_date:
-        # Convert execution_date to string format for SQL
-        start_date = execution_date.strftime("%Y-%m-%d 00:00:00")
-        end_date = (execution_date + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    @abstractmethod
+    def read_incremental_table(self, table_name: str, incremental_column: str, last_value: str):
+        pass
 
-        # Build query to filter by date range
-        # This captures all records created/updated on the execution date
-        query = f"""
-        (SELECT * FROM {table_name} 
-         WHERE {incremental_column} >= '{start_date}' 
-         AND {incremental_column} < '{end_date}') AS filtered_data
-        """
+class JDBCConnection(DBConnection):
+    def __init__(self, spark, db_conn: DBConfig):
+        self.spark = spark
+        self.db_conn = db_conn
+    def read_full_table(self, table_name: str, partition_column: str = None, num_partitions: int = 10):
+        logger.info(f"[Full_load] Reading full table: {table_name}")
+        try:
+            prefix, driver = JDBC_DRIVERS[self.db_conn.db_type]
+            jdbc_url = f"{prefix}://{self.db_conn.host}:{self.db_conn.port}/{self.db_conn.db}"
+            reader = (
+                self.spark.read
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", table_name)
+                .option("user", self.db_conn.user)
+                .option("password", self.db_conn.password)
+                .option("driver", driver)
+                .option("fetchsize", 10000)
+            )
 
-        return spark.read.jdbc(url=jdbc_url, table=query, properties=connection_properties)
-    else:
-        # Full load if no date provided
-        return spark.read.jdbc(url=jdbc_url, table=table_name, properties=connection_properties)
+            if partition_column:
+                bounds_query = (
+                    f"(SELECT MIN({partition_column}), MAX({partition_column}) "
+                    f"FROM {table_name}) AS bounds"
+                )
+                bounds_row = (
+                    self.spark.read.format("jdbc")
+                    .option("url", jdbc_url)
+                    .option("dbtable", bounds_query)
+                    .option("user", self.db_conn.user)
+                    .option("password", self.db_conn.password)
+                    .option("driver", driver)
+                    .load()
+                    .collect()[0]
+                )
+                lower, upper = bounds_row[0], bounds_row[1]
+                if lower is not None and upper is not None:
+                    logger.info(
+                        f"[Full_load] Partitioning '{table_name}' on '{partition_column}' "
+                        f"[{lower}, {upper}] with {num_partitions} partitions"
+                    )
+                    reader = (
+                        reader
+                        .option("partitionColumn", partition_column)
+                        .option("lowerBound", str(lower))
+                        .option("upperBound", str(upper))
+                        .option("numPartitions", num_partitions)
+                    )
+                else:
+                    logger.warning(
+                        f"[Full_load] No rows found for partition bounds on '{table_name}'. "
+                        "Falling back to single-partition read."
+                    )
 
-# host = os.getenv("DB_HOST")
-# port = os.getenv("DB_PORT")
-# db = os.getenv("DATABASE")
-# jdbc_url = f"jdbc:postgresql://{host}:{port}/{db}"
-# print(jdbc_url)
+            return reader.load()
+        except Exception as e:
+            logger.error(f"[Full_load] Failed on '{table_name}': {e}")
+            raise
+
+    def read_incremental_table(
+        self,
+        table_name: str,
+        last_updated: str,
+        last_run: str,
+        partition_column: str = None,
+        num_partitions: int = 10,
+    ):
+        logger.info(f"[IncrementalLoad] Reading '{table_name}' where {last_updated} > '{last_run}'")
+        try:
+            prefix, driver = JDBC_DRIVERS[self.db_conn.db_type]
+            jdbc_url = f"{prefix}://{self.db_conn.host}:{self.db_conn.port}/{self.db_conn.db}"
+
+            # Push the WHERE predicate down to the database so only the
+            # incremental slice is transferred over the network.
+            predicate_query = (
+                f"(SELECT * FROM {table_name} "
+                f"WHERE {last_updated} > '{last_run}') AS incremental"
+            )
+
+            reader = (
+                self.spark.read
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", predicate_query)
+                .option("user", self.db_conn.user)
+                .option("password", self.db_conn.password)
+                .option("driver", driver)
+                .option("fetchsize", 10000)          # fetch 10 k rows per round-trip
+            )
+
+            if partition_column:
+                # Fetch min/max only on the already-filtered slice so the
+                # bounds are tight and partitions are evenly sized.
+                bounds_query = (
+                    f"(SELECT MIN({partition_column}), MAX({partition_column}) "
+                    f"FROM {table_name} "
+                    f"WHERE {last_updated} > '{last_run}') AS bounds"
+                )
+                bounds_row = (
+                    self.spark.read.format("jdbc")
+                    .option("url", jdbc_url)
+                    .option("dbtable", bounds_query)
+                    .option("user", self.db_conn.user)
+                    .option("password", self.db_conn.password)
+                    .option("driver", driver)
+                    .load()
+                    .collect()[0]
+                )
+                lower, upper = bounds_row[0], bounds_row[1]
+
+                if lower is not None and upper is not None:
+                    logger.info(
+                        f"[IncrementalLoad] Partitioning '{table_name}' on '{partition_column}' "
+                        f"[{lower}, {upper}] with {num_partitions} partitions"
+                    )
+                    reader = (
+                        reader
+                        .option("partitionColumn", partition_column)
+                        .option("lowerBound", str(lower))
+                        .option("upperBound", str(upper))
+                        .option("numPartitions", num_partitions)
+                    )
+                else:
+                    logger.warning(
+                        f"[IncrementalLoad] No rows found for partition bounds on '{table_name}'. "
+                        "Falling back to single-partition read."
+                    )
+
+            return reader.load()
+        except Exception as e:
+            logger.error(f"[IncrementalLoad] Failed on '{table_name}': {e}")
+            raise
+
+
+

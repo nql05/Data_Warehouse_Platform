@@ -106,7 +106,7 @@ def load_csv(file_path, table_name):
             if_exists='replace',
             index=False
         )
-        print(f"   -> Successfully loaded {len(df)} rows.")
+        print(f" -> Successfully loaded {len(df)} rows.")
 
         # Add timestamp columns and trigger after loading data
         add_timestamp_columns_and_trigger(table_name)

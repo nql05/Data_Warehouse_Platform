@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import os.path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional, Type
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 class InValidDataException(Exception):
+    pass
+
+class DataQualityException(Exception):
     pass
 
 @dataclass
@@ -19,23 +22,20 @@ class ETLDataset:
     data_format: str
     database: str
     partition_keys: List[str]
+    records_pulled: Optional[int] = None
 
 class TableETL(ABC):
-    @abstractmethod
-    def __init__(self,
-                 spark,
-                 upstream_table_names: Optional[List[Type[TableETL]]],
-                 name: str,
-                 primary_keys: List[str],
-                 storage_path: str,
-                 data_format: str,
-                 database: str,
-                 partition_keys: List[str],
-                 run_upstream: bool = True,
-                 load_data: bool = True,
-                 date_params: Optional[Dict[str, str]] = None
-                 ) -> None:
-
+    def __init__(
+        self,
+        spark,
+        upstream_table_names: Optional[List[Type[TableETL]]],
+        name: str,
+        primary_keys: List[str],
+        storage_path: str,
+        data_format: str,
+        database: str,
+        partition_keys: List[str]
+    ) -> None:
         self.spark = spark
         self.upstream_table_names = upstream_table_names
         self.name = name
@@ -44,57 +44,88 @@ class TableETL(ABC):
         self.data_format = data_format
         self.database = database
         self.partition_keys = partition_keys
-        self.run_upstream = run_upstream
-        self.load_data = load_data
-        self.date_params = date_params or {}
 
     @property
-    def year(self):
-        return self.date_params.get("year", "")
-
-    @property
-    def month(self):
-        return self.date_params.get("month", "")
-
-    @property
-    def day(self):
-        return self.date_params.get("day", "")
-
-    @property
-    def execution_date(self):
-        return self.date_params.get("execution_date")
-
-    def add_partition_columns(self, df: DataFrame) -> DataFrame:
-        """Add year, month, day partition columns"""
-        return (df
-                .withColumn("year", F.lit(self.year))
-                .withColumn("month", F.lit(self.month))
-                .withColumn("day", F.lit(self.day))
-                .withColumn("inserted_time", F.lit(self.execution_date))
-                )
+    def metadata_conn(self):
+        """
+        Subclasses that want audit logging must override this property
+        and return a MetadataConnection instance.
+        """
+        return None
 
     @abstractmethod
     def extract_upstream(self) -> List[ETLDataset]:
         pass
 
     @abstractmethod
-    def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
+    def transform_upstream(
+        self, upstream_datasets: List[ETLDataset]
+    ) -> ETLDataset:
         pass
 
     def validate(self, data: ETLDataset) -> bool:
         return True
 
-    def load(self, data: ETLDataset):
-        data.curr_data.write.format(data.data_format).mode("overwrite").partitionBy("year", "month", "day").save(data.storage_path)
+    def load(self, data: ETLDataset) -> None:
+        (
+            data.curr_data \
+            .write \
+            .format(data.data_format) \
+            .mode("overwrite") \
+            .partitionBy(data.partition_keys) \
+            .save(data.storage_path)
+        )
+
+        # Read back and verify row count matches source
+        if data.records_pulled is not None:
+            written_count = (
+                self.spark.read
+                    .format(data.data_format)
+                    .load(data.storage_path)
+                    .count()
+            )
+            if written_count != data.records_pulled:
+                raise DataQualityException(
+                    f"[{data.name}] Row count mismatch: "
+                    f"extracted {data.records_pulled} rows but "
+                    f"only {written_count} rows written to {data.storage_path}"
+                )
 
     def run(self):
-        transformed_data = self.transform_upstream(self.extract_upstream())
-        if not self.validate(transformed_data):
-            raise InValidDataException(
-                f"The {self.name} dataset did not pass validation, please check the metadata db for more information"
+        """
+        Tracks run_date, start_time, end_time and records_pulled in pipeline_logs
+        """
+        log_id = None
+
+        if self.metadata_conn is not None:
+            log_id = self.metadata_conn.start_pipeline_log(
+                job_name=self.name,
+                run_date=date.today()
             )
-        if self.load_data:
+        try:
+            transformed_data = self.transform_upstream(self.extract_upstream())
+            if not self.validate(transformed_data):
+                raise InValidDataException(
+                    f"The {self.name} dataset did not pass validation, please check the metadata db for more information"
+                )
             self.load(transformed_data)
+
+            # Finish audit log on success
+            if self.metadata_conn is not None and log_id is not None:
+                records = transformed_data.records_pulled or 0
+                self.metadata_conn.finish_pipeline_log(
+                    log_id=log_id,
+                    records_pulled=records
+                )
+
+        except Exception as e:
+            # Finish audit log on failure with -1
+            if self.metadata_conn is not None and log_id is not None:
+                self.metadata_conn.finish_pipeline_log(
+                    log_id=log_id,
+                    records_pulled=-1
+                )
+            raise e
 
     @abstractmethod
     def read(self, partition_values: Optional[Dict[str, str]]) -> ETLDataset:

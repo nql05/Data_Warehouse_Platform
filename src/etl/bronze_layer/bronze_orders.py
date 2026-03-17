@@ -1,117 +1,54 @@
-from datetime import datetime
-from typing import Dict, List, Optional, Type
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+import logging
 
-from src.utils.base_table import ETLDataset, TableETL
-from src.utils.db_connection import get_upstream_table
+# 1. SETUP LOGGING
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ParquetIngest")
 
-class OrderBronzeETL(TableETL):
-    def __init__(self,
-                 spark: SparkSession,
-                 upstream_table_names: Optional[List[Type[TableETL]]] = None,
-                 name: str = "orders",
-                 primary_keys: List[str] = ["order_id"],
-                 storage_path: str = "hdfs://localhost:9000/datalake/bronze/orders",
-                 data_format: str = "parquet",
-                 database: str = "ecommerce",
-                 partition_keys: List[str] = ["inserted_time"],
-                 run_upstream: bool = True,
-                 load_data: bool = True
-                 ) -> None:
-        super().__init__(
-            spark,
-            upstream_table_names,
-            name,
-            primary_keys,
-            storage_path,
-            data_format,
-            database,
-            partition_keys,
-            run_upstream,
-            load_data
-        )
+# 2. INITIALIZE SPARK
+spark = (SparkSession.builder
+    .appName("Orders_Kafka_To_Parquet_Bronze")
+    .config("spark.sql.shuffle.partitions", "16")
+    .getOrCreate())
 
-    def extract_upstream(self) -> List[ETLDataset]:
-        table_name = "orders"
-        order_data = get_upstream_table(table_name, self.spark)
+# 3. SCHEMA DEFINITION
+payload_schema = StructType([
+    StructField("order_id", StringType()),
+    StructField("customer_id", StringType()),
+    StructField("order_status", StringType()),
+    StructField("order_purchase_timestamp", TimestampType()),
+    StructField("updated_at", TimestampType()),
+])
 
-        # Create ETLDataset instance
-        order_dataset = ETLDataset(
-            name=self.name,
-            curr_data=order_data, # DataFrame
-            primary_keys=self.primary_keys,
-            storage_path=self.storage_path,
-            data_format=self.data_format,
-            database=self.database,
-            partition_keys=self.partition_keys
-        )
+# 4. READ STREAM
+logger.info("Reading from Kafka...")
+raw_stream = (spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "orders_topic")
+    .option("startingOffsets", "earliest")
+    .option("failOnDataLoss", "false")
+    .load())
 
-        return [order_dataset]
+# 5. TRANSFORMATION
+parsed_stream = (raw_stream
+    .selectExpr("CAST(value AS STRING) AS json_str")
+    .select(F.from_json("json_str", payload_schema).alias("data"))
+    .select("data.*")
+    .withColumn("updated_date", F.to_date("updated_at"))
+    .withWatermark("updated_at", "10 minutes")
+    .dropDuplicates(["order_id", "updated_at"]))
 
-    def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
-        user_data = upstream_datasets[0].curr_data
-        current_timestamp = datetime.now()
+# 6. WRITE STREAM (Modified for Parquet)
+logger.info("Writing to Parquet destination...")
+query = (parsed_stream.writeStream
+    .format("parquet") # Changed from delta to parquet
+    .option("checkpointLocation", "hdfs://localhost:9000/checkpoint/bronze/orders")
+    .partitionBy("updated_date")
+    .outputMode("append")
+    .trigger(processingTime="30 seconds")
+    .start("hdfs://localhost:9000/datalake/bronze/orders"))
 
-        transformed_data = user_data.withColumn("inserted_time", lit(current_timestamp))
-
-        etl_dataset = ETLDataset(
-            name=self.name,
-            curr_data=transformed_data,
-            primary_keys=self.primary_keys,
-            storage_path=self.storage_path,
-            data_format=self.data_format,
-            database=self.database,
-            partition_keys=self.partition_keys
-        )
-
-        return etl_dataset
-
-    def read(self, partition_values: Optional[Dict[str, str]]) -> ETLDataset:
-        partition_filter = ""
-        data = self.transform_upstream(self.extract_upstream())
-        if not self.load_data:
-            return ETLDataset(
-                name=self.name,
-                curr_data=data.curr_data,
-                primary_keys=self.primary_keys,
-                storage_path=self.storage_path,
-                data_format=self.data_format,
-                database=self.database,
-                partition_keys=self.partition_keys
-            )
-        elif partition_values:
-            partition_filter = " AND ".join(
-                [f"{k} = '{v}'" for k, v in partition_values.items()]
-            )
-        else:
-            latest_partition = (
-                self.spark.read.format(self.data_format).load(self.storage_path).selectExpr("max(inserted_time)").collect()[0][0]
-            )
-            partition_filter = f"inserted_time = '{latest_partition}'"
-
-        # Read the user data from the HDFS
-        user_data = self.spark.read.format(self.data_format).load(self.storage_path).filter(partition_filter)
-
-        user_data = user_data.select(
-            col("order_id"),
-            col("customer_id"),
-            col("order_status"),
-            col("order_purchase_timestamp"),
-            col("order_approved_at"),
-            col("order_delivered_carrier_date"),
-            col("order_delivered_customer_date"),
-            col("order_estimated_delivery_date"),
-            col("inserted_time")
-        )
-
-        etl_dataset = ETLDataset(
-            name=self.name,
-            curr_data=user_data,
-            primary_keys=self.primary_keys,
-            storage_path=self.storage_path,
-            data_format=self.data_format,
-            database=self.database,
-            partition_keys=self.partition_keys
-        )
-        return etl_dataset
+# 7. KEEP ALIVE
+query.awaitTermination()

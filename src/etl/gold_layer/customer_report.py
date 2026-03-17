@@ -1,30 +1,28 @@
-from datetime import datetime
 from typing import Dict, List, Optional, Type
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
+from pyspark.sql import functions as F
 
-from src.etl.silver_layer.dim_customer import DimCustomerSilverETL
-from src.etl.silver_layer.fact_sale import FactSaleSilverETL
-from src.utils.base_table import ETLDataset, TableETL
+from utils.base_table import ETLDataset, TableETL, DataQualityException
+from utils.db_connection import JDBCConnection
+from utils.metadata_connection import MetadataConnection
+from etl.silver_layer.dim_customer import DimCustomerSilverETL
+from etl.silver_layer.fact_sale import FactSaleSilverETL
+
 
 class CustomerReportGoldETL(TableETL):
     def __init__(self,
                  spark: SparkSession,
-                 upstream_table_names: Optional[List[Type[TableETL]]] = [
-                     DimCustomerSilverETL,
-                     FactSaleSilverETL
-                 ],
+                 jdbc_conn: JDBCConnection,
+                 metadata_jdbc_conn: JDBCConnection,
+                 upstream_table_names: Optional[List[Type[TableETL]]] = None,
                  name: str = "customer_report",
                  primary_keys: List[str] = ["order_id", "order_item_id"],
-                 storage_path: str = "hdfs://localhost:9000/warehouse/customer_reports",
+                 storage_path: str = "hdfs://localhost:9000/datalake/gold/customer_report",
                  data_format: str = "parquet",
                  database: str = "ecommerce",
-                 partition_keys: List[str] = ["order_inserted_time"],
-                 run_upstream: bool = True,
-                 load_data: bool = True,
-                 date_params: dict
-                 ):
+                 partition_keys: List[str] = ["updated_date"]
+                 ) -> None:
         super().__init__(
             spark,
             upstream_table_names,
@@ -33,57 +31,138 @@ class CustomerReportGoldETL(TableETL):
             storage_path,
             data_format,
             database,
-            partition_keys,
-            run_upstream,
-            load_data,
-            date_params
+            partition_keys
         )
+        self.jdbc_conn = jdbc_conn
+        self.metadata_jdbc_conn = MetadataConnection(metadata_jdbc_conn)
 
-    def load(self, data: ETLDataset):
-        """
-        Write data as Hive table
-        :param data:
-        :return:
-        """
-        table_name = f"{self.database}.{self.name}"
-
-        data.curr_data.write.mode("overwrite").format("parquet").partitionBy(self.partition_keys).saveAsTable(table_name)
-
+    @property
+    def metadata_conn(self):
+        return self.metadata_jdbc_conn
 
     def extract_upstream(self) -> List[ETLDataset]:
-        upstream_etl_datasets = []
-        for TableETLClass in self.upstream_table_names:
-            t1 = TableETLClass(
-                spark=self.spark,
-                run_upstream=self.run_upstream,
-                load_data=self.load_data,
-            )
-            if self.run_upstream:
-                t1.run()
-            upstream_etl_datasets.append(t1.read(None))
+        dim_customer_etl = DimCustomerSilverETL(
+            spark=self.spark,
+            jdbc_conn=self.jdbc_conn,
+            metadata_jdbc_conn=self.metadata_jdbc_conn.jdbc_conn
+        )
+        dim_customer_etl.run()
 
-        return upstream_etl_datasets
+        fact_sale_etl = FactSaleSilverETL(
+            spark=self.spark,
+            jdbc_conn=self.jdbc_conn,
+            metadata_jdbc_conn=self.metadata_jdbc_conn.jdbc_conn
+        )
+        fact_sale_etl.run()
+
+        return [
+            dim_customer_etl.read(partition_values=None),
+            fact_sale_etl.read(partition_values=None),
+        ]
 
     def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
-        # DataFrame of customers table and geolocation table
         dim_customer_data = upstream_datasets[0].curr_data
         fact_sale_data = upstream_datasets[1].curr_data
 
-        # Get columns with same name in both customer_data and geolocation
-        # Rename these columns to avoid conflicts
-        dim_customer_data = dim_customer_data.withColumnRenamed("customer_id", "dim_customer_id")
+        dim_customer_data = dim_customer_data \
+            .withColumnRenamed("customer_id", "dim_customer_id") \
+            .withColumnRenamed("updated_date", "dim_updated_date")
 
-        # Sort-Merge for handle joining 2 big tables
-        dim_customer_data = dim_customer_data.repartition("dim_customer_id")
-        fact_sale_data = fact_sale_data.repartition("customer_id")
+        joined_data = fact_sale_data.join(
+            dim_customer_data,
+            fact_sale_data["customer_id"] == dim_customer_data["dim_customer_id"],
+            "left"
+        )
 
-        # Perform the join based on foreign keys
-        customer_report_data = fact_sale_data.join(dim_customer_data,
-                                               fact_sale_data["customer_id"] == dim_customer_data[
-                                                   "dim_customer_id"],
-                                               "left")
+        customer_agg = joined_data.groupBy(
+            "customer_id",
+            "customer_unique_id",
+            "customer_city",
+            "customer_state",
+            fact_sale_data["updated_date"].alias("updated_date")
+        ).agg(
+            F.countDistinct("order_id").alias("total_orders"),
+            F.sum("total_amount").alias("total_revenue"),
+            F.sum(F.when(F.col("order_status") == "canceled", 1).otherwise(0)).alias("canceled_orders"),
+            F.avg("review_score").alias("avg_review_score"),
+            F.max("order_purchase_timestamp").alias("last_purchase_timestamp")
+        )
 
-        etl_dataset = ETLDataset(
+        customer_report_data = customer_agg.withColumn(
+            "avg_order_value",
+            F.when(F.col("total_orders") > 0, F.col("total_revenue") / F.col("total_orders")).otherwise(F.lit(0.0))
+        )
+
+        return ETLDataset(
+            name=self.name,
+            curr_data=customer_report_data,
+            primary_keys=self.primary_keys,
+            storage_path=self.storage_path,
+            data_format=self.data_format,
+            database=self.database,
+            partition_keys=self.partition_keys,
+            records_pulled=customer_report_data.count()
+        )
+
+    def load(self, data: ETLDataset) -> None:
+        (
+            data.curr_data \
+             .write \
+             .format(data.data_format) \
+             .mode("overwrite") \
+             .partitionBy(data.partition_keys) \
+             .option("path", data.storage_path) \
+             .saveAsTable("report.customer_report")
+         )
+
+        # Read back and verify row count matches source
+        if data.records_pulled is not None:
+            written_count = (
+                self.spark.read
+                .format(data.data_format)
+                .load(data.storage_path)
+                .count()
+            )
+            if written_count != data.records_pulled:
+                raise DataQualityException(
+                    f"[{data.name}] Row count mismatch: "
+                    f"extracted {data.records_pulled} rows but "
+                    f"only {written_count} rows written to {data.storage_path}"
+                )
+
+    def read(self, partition_values: Optional[Dict[str, str]] = None) -> ETLDataset:
+        if partition_values:
+            partition_filter = " AND ".join(f"{k} = '{v}'" for k, v in partition_values.items())
+        else:
+            latest_partition = (
+                self.spark.read.format(self.data_format)
+                .load(self.storage_path)
+                .selectExpr("max(updated_date)")
+                .collect()[0][0]
+            )
+            partition_filter = f"updated_date = '{latest_partition}'"
+
+        raw_data = (
+            self.spark.read.format(self.data_format)
+            .load(self.storage_path)
+            .filter(partition_filter)
+        )
+
+        customer_report_data = raw_data.select(
+        "customer_id",
+        "customer_unique_id",
+        "customer_city",
+        "customer_state",
+        "total_orders",
+        "canceled_orders",
+        "total_revenue",
+        "avg_order_value",
+        "avg_review_score",
+        "last_purchase_timestamp",
+        "updated_date"
+        )
+
+        return ETLDataset(
             name=self.name,
             curr_data=customer_report_data,
             primary_keys=self.primary_keys,
@@ -92,63 +171,3 @@ class CustomerReportGoldETL(TableETL):
             database=self.database,
             partition_keys=self.partition_keys
         )
-        return etl_dataset
-
-    def read(self, partition_values: Optional[Dict[str, str]]) -> ETLDataset:
-        partition_filter = ""
-
-        selected_columns = [
-            col("order_id"),
-            col("order_item_id"),
-            col("price"),
-            col("total_amount"),
-            col("review_score"),
-            col("customer_id"),
-            col("customer_city"),
-            col("customer_state"),
-            col("geolocation_lat"),
-            col("geolocation_lng")
-        ]
-
-        data = self.transform_upstream(self.extract_upstream())
-
-        if not self.load_data:
-            return ETLDataset(
-                name=self.name,
-                curr_data=data.curr_data.select(selected_columns),
-                primary_keys=self.primary_keys,
-                storage_path=self.storage_path,
-                data_format=self.data_format,
-                database=self.database,
-                partition_keys=self.partition_keys,
-            )
-
-        # Read from Hive table instead of path
-        table_name = f"{self.database}.{self.name}"
-
-        if partition_values:
-            partition_filter = " AND ".join(
-                [f"{k} = '{v}'" for k, v in partition_values.items()]
-            )
-        else:
-            latest_partition = (
-                self.spark.sql(f"SELECT max(order_inserted_time) FROM {table_name}")
-                .collect()[0][0]
-            )
-            partition_filter = f"order_inserted_time = '{latest_partition}'"
-
-        customer_report_data = self.spark.sql(
-            f"SELECT * FROM {table_name} WHERE {partition_filter}"
-        ).select(selected_columns)
-
-        # Create an ETLDataSet instance
-        etl_dataset = ETLDataset(
-            name=self.name,
-            curr_data=customer_report_data,
-            primary_keys=self.primary_keys,
-            storage_path=self.storage_path,
-            data_format=self.data_format,
-            database=self.database,
-            partition_keys=self.partition_keys,
-        )
-        return etl_dataset
