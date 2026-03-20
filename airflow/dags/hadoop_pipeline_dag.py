@@ -54,12 +54,12 @@ with DAG(
         append_env=True,
     )
 
-    orders_stream = BashOperator(
-        task_id="submit_orders_stream",
-        bash_command=f"{SPARK_SUBMIT_CMD} {PROJECT_PATH}/src/etl/bronze_layer/bronze_orders.py",
-        env=SPARK_ENV,
-        append_env=True,
-    )
+    # orders_stream = BashOperator(
+    #     task_id="submit_orders_stream",
+    #     bash_command=f"{SPARK_SUBMIT_CMD} {PROJECT_PATH}/src/etl/bronze_layer/bronze_orders.py",
+    #     env=SPARK_ENV,
+    #     append_env=True,
+    # )
 
     silver_layer = BashOperator(
         task_id="submit_silver_layer",
@@ -68,12 +68,12 @@ with DAG(
         append_env=True,
     )
 
-    # gold_layer = BashOperator(
-    #     task_id="submit_gold_layer",
-    #     bash_command=f"{SPARK_SUBMIT_CMD} {PROJECT_PATH}/src/etl/gold_layer/run_gold.py",
-    #     env=SPARK_ENV,
-    #     append_env=True,
-    # )
+    gold_layer = BashOperator(
+        task_id="submit_gold_layer",
+        bash_command=f"{SPARK_SUBMIT_CMD} {PROJECT_PATH}/src/etl/gold_layer/run_gold.py",
+        env=SPARK_ENV,
+        append_env=True,
+    )
 
-    # bronze_layer >> silver_layer >> gold_layer
-    [orders_stream, bronze_layer] >> silver_layer
+    bronze_layer >> silver_layer >> gold_layer
+    # [orders_stream, bronze_layer] >> silver_layer

@@ -1,54 +1,149 @@
-from pyspark.sql import SparkSession, functions as F
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
-import logging
+from typing import Dict, List, Optional, Type
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-# 1. SETUP LOGGING
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ParquetIngest")
+from utils.base_table import ETLDataset, TableETL, DataQualityException
+from utils.db_connection import JDBCConnection
+from utils.metadata_connection import MetadataConnection
 
-# 2. INITIALIZE SPARK
-spark = (SparkSession.builder
-    .appName("Orders_Kafka_To_Parquet_Bronze")
-    .config("spark.sql.shuffle.partitions", "16")
-    .getOrCreate())
 
-# 3. SCHEMA DEFINITION
-payload_schema = StructType([
-    StructField("order_id", StringType()),
-    StructField("customer_id", StringType()),
-    StructField("order_status", StringType()),
-    StructField("order_purchase_timestamp", TimestampType()),
-    StructField("updated_at", TimestampType()),
-])
+class OrderBronzeETL(TableETL):
+    def __init__(self,
+                 spark: SparkSession,
+                 jdbc_conn: JDBCConnection,
+                 metadata_jdbc_conn: JDBCConnection,
+                 upstream_table_names: Optional[List[Type[TableETL]]] = None,
+                 name: str = "orders",
+                 primary_keys: List[str] = ["order_id"],
+                 storage_path: str = "hdfs://localhost:9000/datalake/bronze/orders",
+                 data_format: str = "parquet",
+                 database: str = "ecommerce",
+                 partition_keys: List[str] = ["updated_date"]
+                 ) -> None:
+        super().__init__(
+            spark,
+            upstream_table_names,
+            name,
+            primary_keys,
+            storage_path,
+            data_format,
+            database,
+            partition_keys
+        )
+        self.jdbc_conn = jdbc_conn
+        self.metadata_jdbc_conn = MetadataConnection(metadata_jdbc_conn)
 
-# 4. READ STREAM
-logger.info("Reading from Kafka...")
-raw_stream = (spark.readStream
-    .format("kafka")
-    .option("kafka.bootstrap.servers", "localhost:9092")
-    .option("subscribe", "orders_topic")
-    .option("startingOffsets", "earliest")
-    .option("failOnDataLoss", "false")
-    .load())
+    @property
+    def metadata_conn(self):
+        return self.metadata_jdbc_conn
 
-# 5. TRANSFORMATION
-parsed_stream = (raw_stream
-    .selectExpr("CAST(value AS STRING) AS json_str")
-    .select(F.from_json("json_str", payload_schema).alias("data"))
-    .select("data.*")
-    .withColumn("updated_date", F.to_date("updated_at"))
-    .withWatermark("updated_at", "10 minutes")
-    .dropDuplicates(["order_id", "updated_at"]))
+    def extract_upstream(self) -> List[ETLDataset]:
+        table_name = "orders"
 
-# 6. WRITE STREAM (Modified for Parquet)
-logger.info("Writing to Parquet destination...")
-query = (parsed_stream.writeStream
-    .format("parquet") # Changed from delta to parquet
-    .option("checkpointLocation", "hdfs://localhost:9000/checkpoint/bronze/orders")
-    .partitionBy("updated_date")
-    .outputMode("append")
-    .trigger(processingTime="30 seconds")
-    .start("hdfs://localhost:9000/datalake/bronze/orders"))
+        src_metadata = self.metadata_conn.get_source_metadata(table_name)
+        pull_typ = src_metadata.pull_typ.upper()
 
-# 7. KEEP ALIVE
-query.awaitTermination()
+        qualified_table = (
+            f"{src_metadata.src_schema_name}.{src_metadata.src_tbname}"
+            if src_metadata.src_schema_name
+            else src_metadata.src_tbname
+        )
+
+        if pull_typ == "FULL":
+            orders_data = self.jdbc_conn.read_full_table(
+                table_name=qualified_table,
+                partition_column="updated_at",
+                num_partitions=16
+            )
+        elif pull_typ == "INCREMENTAL":
+            last_run = self.metadata_jdbc_conn.get_last_successful_run(self.name)
+            orders_data = self.jdbc_conn.read_incremental_table(
+                table_name=qualified_table,
+                last_updated="updated_at",
+                last_run=last_run,
+                partition_column=self.partition_keys[0],
+                num_partitions=16
+            )
+        else:
+            raise ValueError(
+                f"[OrderBronzeETL] Unknown pull_type '{pull_typ}' "
+                f"for source table '{table_name}'"
+            )
+
+        records_pulled = orders_data.count()
+
+        orders_dataset = ETLDataset(
+            name=self.name,
+            curr_data=orders_data,
+            primary_keys=self.primary_keys,
+            storage_path=self.storage_path,
+            data_format=self.data_format,
+            database=self.database,
+            partition_keys=self.partition_keys,
+            records_pulled=records_pulled
+        )
+
+        return [orders_dataset]
+
+    def transform_upstream(self, upstream_datasets: List[ETLDataset]) -> ETLDataset:
+        orders_data = upstream_datasets[0].curr_data
+        records_pulled = upstream_datasets[0].records_pulled
+
+        transformed_data = (
+            orders_data
+            .withColumn("updated_date", F.to_date(F.col("updated_at")))
+        )
+
+        etl_dataset = ETLDataset(
+            name=self.name,
+            curr_data=transformed_data,
+            primary_keys=self.primary_keys,
+            storage_path=self.storage_path,
+            data_format=self.data_format,
+            database=self.database,
+            partition_keys=self.partition_keys,
+            records_pulled=records_pulled
+        )
+        return etl_dataset
+
+    def read(self, partition_values: Optional[Dict[str, str]] = None) -> ETLDataset:
+        if partition_values:
+            partition_filter = " AND ".join(
+                f"{k} = '{v}'" for k, v in partition_values.items()
+            )
+        else:
+            latest_partition = (
+                self.spark.read.format(self.data_format)
+                .load(self.storage_path)
+                .selectExpr("max(updated_date)")
+                .collect()[0][0]
+            )
+            partition_filter = f"updated_date = '{latest_partition}'"
+
+        raw_data = (
+            self.spark.read.format(self.data_format)
+            .load(self.storage_path)
+            .filter(partition_filter)
+        )
+
+        orders_data = raw_data.select(
+            F.col("order_id"),
+            F.col("customer_id"),
+            F.col("order_status"),
+            F.col("order_purchase_timestamp"),
+            F.col("order_approved_at"),
+            F.col("order_delivered_carrier_date"),
+            F.col("order_delivered_customer_date"),
+            F.col("order_estimated_delivery_date"),
+            F.col("updated_date")
+        )
+
+        return ETLDataset(
+            name=self.name,
+            curr_data=orders_data,
+            primary_keys=self.primary_keys,
+            storage_path=self.storage_path,
+            data_format=self.data_format,
+            database=self.database,
+            partition_keys=self.partition_keys
+        )

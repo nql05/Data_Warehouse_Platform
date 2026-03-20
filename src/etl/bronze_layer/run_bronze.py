@@ -9,6 +9,7 @@ from etl.bronze_layer.bronze_order_payments import OrderPaymentBronzeETL
 from etl.bronze_layer.bronze_order_reviews import OrderReviewBronzeETL
 from etl.bronze_layer.bronze_products import ProductBronzeETL
 from etl.bronze_layer.bronze_sellers import SellerBronzeETL
+from etl.bronze_layer.bronze_orders import OrderBronzeETL
 from utils.db_connection import JDBCConnection, DBConfig
 
 spark = SparkSession.builder.appName("BronzeLayer").getOrCreate()
@@ -45,6 +46,7 @@ BRONZE_ETL_CLASSES = [
     OrderReviewBronzeETL,
     ProductBronzeETL,
     SellerBronzeETL,
+    OrderBronzeETL
 ]
 
 for etl_class in BRONZE_ETL_CLASSES:
